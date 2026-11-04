@@ -199,6 +199,96 @@ struct ResearchWorker {
     max_calls: usize,
 }
 
+struct ParallelAdvisor;
+
+impl ParallelAdvisor {
+    fn roles(route: TaskRoute, objective: &str) -> Vec<&'static str> {
+        let lower = objective.to_ascii_lowercase();
+        if route == TaskRoute::Planning {
+            vec!["decomposition analyst", "risk and dependency reviewer"]
+        } else if route == TaskRoute::SimpleCoding
+            && ["complex", "multiple", "several", "edge cases", "refactor"]
+                .iter()
+                .any(|term| lower.contains(term))
+        {
+            vec!["implementation analyst", "edge-case reviewer"]
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn run(
+        model: &ModelClient,
+        route: TaskRoute,
+        objective: &str,
+    ) -> (Vec<Event>, Vec<String>) {
+        let roles = Self::roles(route, objective);
+        if roles.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let mut workers = tokio::task::JoinSet::new();
+        for (index, role) in roles.into_iter().enumerate() {
+            let worker_model = model.clone();
+            let worker_objective = objective.to_string();
+            let role = role.to_string();
+            workers.spawn(async move {
+                let context = format!(
+                    "Objective: {worker_objective}\nRole: {role}\nReturn one concise advisory finding. Do not modify files, execute commands, or claim verification."
+                );
+                let result = worker_model
+                    .choose(
+                        "You are a bounded parallel advisory sub-agent. Analyze only your assigned role and return a finish action containing evidence-based advice.",
+                        &context,
+                    )
+                    .await;
+                (index, role, result)
+            });
+        }
+
+        let mut events = Vec::new();
+        let mut findings = Vec::new();
+        while let Some(result) = workers.join_next().await {
+            match result {
+                Ok((index, role, Ok(Action::Finish { answer }))) => {
+                    let finding = format!("{role}: {answer}");
+                    events.push(Event {
+                        step: index,
+                        role: "parallel_advisor".into(),
+                        content: finding.clone(),
+                    });
+                    findings.push(finding);
+                }
+                Ok((index, role, Ok(action))) => {
+                    let finding = format!(
+                        "{role} returned advisory action: {}",
+                        serde_json::to_string(&action).unwrap_or_default()
+                    );
+                    events.push(Event {
+                        step: index,
+                        role: "parallel_advisor".into(),
+                        content: finding.clone(),
+                    });
+                    findings.push(finding);
+                }
+                Ok((index, role, Err(error))) => {
+                    events.push(Event {
+                        step: index,
+                        role: "parallel_advisor_error".into(),
+                        content: format!("{role}: {error}"),
+                    });
+                }
+                Err(error) => events.push(Event {
+                    step: 0,
+                    role: "parallel_advisor_join_error".into(),
+                    content: error.to_string(),
+                }),
+            }
+        }
+        findings.sort();
+        (events, findings)
+    }
+}
+
 impl ResearchWorker {
     fn bounded(max_calls: usize) -> Self {
         Self {
@@ -316,6 +406,17 @@ impl AutonomousAgent {
             verification_failures: Vec::new(),
             research_findings: Vec::new(),
         };
+        let (advisor_events, advisor_findings) =
+            ParallelAdvisor::run(&self.model, route, objective).await;
+        events.extend(advisor_events);
+        for (index, finding) in advisor_findings.iter().enumerate() {
+            memory.remember(
+                &format!("parallel-advice-{index}"),
+                finding,
+                MemoryKind::Evidence,
+                6,
+            );
+        }
         if route == TaskRoute::ResearchAssisted {
             let worker = ResearchWorker::bounded(2);
             let (research_events, findings) = worker.run(&self.model, &tools, objective).await;
@@ -625,7 +726,7 @@ fn normalize_written_content(path: &str, content: String) -> String {
 mod model_error_tests {
     use super::{
         classify_task, compact_context, is_fatal_model_error, normalize_written_content,
-        parse_action, Action, TaskRoute, TaskState,
+        parse_action, Action, ParallelAdvisor, TaskRoute, TaskState,
     };
     use crate::memory::LongContextMemory;
 
@@ -704,6 +805,19 @@ mod model_error_tests {
             classify_task("Implement a Python function"),
             TaskRoute::SimpleCoding
         );
+    }
+
+    #[test]
+    fn parallel_advisors_are_bounded_and_route_gated() {
+        assert_eq!(
+            ParallelAdvisor::roles(TaskRoute::Planning, "design a workflow").len(),
+            2
+        );
+        assert_eq!(
+            ParallelAdvisor::roles(TaskRoute::SimpleCoding, "implement a complex parser").len(),
+            2
+        );
+        assert!(ParallelAdvisor::roles(TaskRoute::General, "summarize this").is_empty());
     }
 }
 
