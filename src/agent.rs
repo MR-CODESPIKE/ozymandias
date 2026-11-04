@@ -83,6 +83,7 @@ struct TaskState {
     verified: bool,
     changed_files: Vec<String>,
     verification_failures: Vec<String>,
+    research_findings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -189,6 +190,90 @@ impl ModelClient {
     }
 }
 
+struct ResearchWorker {
+    max_calls: usize,
+}
+
+impl ResearchWorker {
+    fn bounded(max_calls: usize) -> Self {
+        Self {
+            max_calls: max_calls.max(1),
+        }
+    }
+
+    async fn run(
+        &self,
+        model: &ModelClient,
+        tools: &ToolRegistry,
+        objective: &str,
+    ) -> (Vec<Event>, Vec<String>) {
+        let mut events = Vec::new();
+        let mut findings = Vec::new();
+        let mut context = format!(
+            "Research objective: {objective}\nReturn web_get for an authoritative source or finish with a concise, source-cited finding."
+        );
+        for step in 0..self.max_calls {
+            let action = match model
+                .choose(
+                    "You are a bounded research worker. Use only web_get and finish. Prefer primary documentation, official specifications, or authoritative sources. Do not modify files or run shell commands.",
+                    &context,
+                )
+                .await
+            {
+                Ok(action) => action,
+                Err(error) => {
+                    findings.push(format!("Research worker error: {error}"));
+                    events.push(Event {
+                        step,
+                        role: "research_error".into(),
+                        content: error.to_string(),
+                    });
+                    break;
+                }
+            };
+            match action {
+                Action::WebGet { url } => {
+                    let result = tools.web_get(&url).await;
+                    let detail = format_result(result);
+                    let excerpt = detail.chars().take(4000).collect::<String>();
+                    findings.push(format!("Source: {url}\n{excerpt}"));
+                    events.push(Event {
+                        step,
+                        role: "research_tool".into(),
+                        content: format!("web_get {url}\n{excerpt}"),
+                    });
+                    context = format!(
+                        "Research objective: {objective}\nPrevious source result:\n{excerpt}\nReturn another web_get for a missing authoritative source or finish with a concise, source-cited finding."
+                    );
+                }
+                Action::Finish { answer } => {
+                    findings.push(answer.clone());
+                    events.push(Event {
+                        step,
+                        role: "researcher".into(),
+                        content: answer,
+                    });
+                    break;
+                }
+                other => {
+                    let message = format!(
+                        "Research worker rejected non-research action: {}",
+                        serde_json::to_string(&other).unwrap_or_default()
+                    );
+                    findings.push(message.clone());
+                    events.push(Event {
+                        step,
+                        role: "research_controller".into(),
+                        content: message,
+                    });
+                    break;
+                }
+            }
+        }
+        (events, findings)
+    }
+}
+
 pub struct AutonomousAgent {
     pub model: ModelClient,
     pub max_steps: usize,
@@ -221,7 +306,18 @@ impl AutonomousAgent {
             verified: false,
             changed_files: Vec::new(),
             verification_failures: Vec::new(),
+            research_findings: Vec::new(),
         };
+        if route == TaskRoute::ResearchAssisted {
+            let worker = ResearchWorker::bounded(2);
+            let (research_events, findings) = worker.run(&self.model, &tools, objective).await;
+            events.extend(research_events);
+            state.research_findings = findings;
+            state.phase = "implement".into();
+            todo[0] = format!(
+                "Use the bounded research findings in task_state, then complete and verify: {objective}"
+            );
+        }
         for step in 0..self.max_steps {
             let context = compact_context(&todo, &events, &state)?;
             let system = format!(
@@ -538,6 +634,7 @@ mod model_error_tests {
             verified: false,
             changed_files: vec!["solution.py".into()],
             verification_failures: vec!["syntax error".into()],
+            research_findings: vec!["Source: https://example.com".into()],
         };
         let context = compact_context(&["repair".into()], &[], &state).unwrap();
         assert!(context.contains("solution.py"));
