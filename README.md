@@ -31,3 +31,5 @@ The repository includes runners for HumanEval and sanitized MBPP. Generated data
 ## Current validation
 
 The current optimized source passes all 8 Rust unit tests and builds successfully in release mode. Recent local benchmark work focused on flexible model response envelopes and repair of double-escaped Python source returned by some providers.
+
+Benchmark results are documented in [`benchmarks/README.md`](benchmarks/README.md). The latest complete HumanEval run passed 112/164 tasks (68.29%). The latest MBPP rerun reached 195/240 tasks (81.25%) before the provider quota boundary; its raw full-suite accounting is 195/427 and is explicitly marked quota-contaminated in the benchmark report.
