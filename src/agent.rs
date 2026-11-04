@@ -41,6 +41,17 @@ pub struct AgentResult {
     pub steps: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskState {
+    objective: String,
+    phase: String,
+    repair_cycles: usize,
+    verification_failed: bool,
+    verified: bool,
+    changed_files: Vec<String>,
+    verification_failures: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct ModelClient {
     client: Client,
@@ -167,8 +178,17 @@ impl AutonomousAgent {
         let mut repeated_actions = 0usize;
         let mut repair_cycles = 0usize;
         let mut verification_failed = false;
+        let mut state = TaskState {
+            objective: objective.to_string(),
+            phase: "implement".into(),
+            repair_cycles: 0,
+            verification_failed: false,
+            verified: false,
+            changed_files: Vec::new(),
+            verification_failures: Vec::new(),
+        };
         for step in 0..self.max_steps {
-            let context = compact_context(&todo, &events)?;
+            let context = compact_context(&todo, &events, &state)?;
             let action = match self.model.choose("Maintain the todo, act only with an available safe tool, and finish when evidence is sufficient.", &context).await {
                 Ok(action) => action,
                 Err(error) => {
@@ -207,6 +227,7 @@ impl AutonomousAgent {
             match action {
                 Action::Finish { answer } => {
                     if verification_failed {
+                        state.phase = "repair".into();
                         events.push(Event {
                             step,
                             role: "controller".into(),
@@ -240,6 +261,9 @@ impl AutonomousAgent {
                     });
                 }
                 Action::WriteFile { path, content } => {
+                    if !state.changed_files.contains(&path) {
+                        state.changed_files.push(path.clone());
+                    }
                     let content = normalize_written_content(&path, content);
                     let r = tools
                         .write_file(&path, &content)
@@ -255,6 +279,9 @@ impl AutonomousAgent {
                     let has_solution = files.contains_key("solution.py");
                     let has_tests = files.contains_key("test_solution.py");
                     for (path, content) in files {
+                        if !state.changed_files.contains(&path) {
+                            state.changed_files.push(path.clone());
+                        }
                         let content = normalize_written_content(&path, content);
                         let result = tools
                             .write_file(&path, &content)
@@ -278,12 +305,16 @@ impl AutonomousAgent {
                             )
                             .await;
                         let passed = verification.is_ok();
+                        let verification_detail = format_result(verification);
                         events.push(Event {
                             step,
                             role: "tool".into(),
-                            content: format_result(verification),
+                            content: verification_detail.clone(),
                         });
                         if passed {
+                            state.phase = "complete".into();
+                            state.verified = true;
+                            state.verification_failed = false;
                             return Ok(AgentResult {
                                 answer: "Generated solution passed the bundled tests.".into(),
                                 events,
@@ -292,6 +323,10 @@ impl AutonomousAgent {
                         }
                         verification_failed = true;
                         repair_cycles += 1;
+                        state.phase = "repair".into();
+                        state.repair_cycles = repair_cycles;
+                        state.verification_failed = true;
+                        state.verification_failures.push(verification_detail);
                         if repair_cycles >= 3 {
                             return Ok(AgentResult {
                                 answer: "Verification failed after three bounded repair cycles."
@@ -364,7 +399,10 @@ fn normalize_written_content(path: &str, content: String) -> String {
 
 #[cfg(test)]
 mod model_error_tests {
-    use super::{is_fatal_model_error, normalize_written_content, parse_action, Action};
+    use super::{
+        compact_context, is_fatal_model_error, normalize_written_content, parse_action, Action,
+        TaskState,
+    };
 
     #[test]
     fn quota_429_is_fatal_and_does_not_consume_step_budget() {
@@ -396,9 +434,25 @@ mod model_error_tests {
         let repaired = normalize_written_content("solution.py", source);
         assert_eq!(repaired, "def f():\n    return \"ok\"\n");
     }
+
+    #[test]
+    fn compact_context_preserves_typed_task_state() {
+        let state = TaskState {
+            objective: "build it".into(),
+            phase: "repair".into(),
+            repair_cycles: 1,
+            verification_failed: true,
+            verified: false,
+            changed_files: vec!["solution.py".into()],
+            verification_failures: vec!["syntax error".into()],
+        };
+        let context = compact_context(&["repair".into()], &[], &state).unwrap();
+        assert!(context.contains("solution.py"));
+        assert!(context.contains("syntax error"));
+    }
 }
 
-fn compact_context(todo: &[String], events: &[Event]) -> Result<String> {
+fn compact_context(todo: &[String], events: &[Event], state: &TaskState) -> Result<String> {
     let recent: Vec<serde_json::Value> = events
         .iter()
         .rev()
@@ -412,9 +466,11 @@ fn compact_context(todo: &[String], events: &[Event]) -> Result<String> {
             serde_json::to_value(copy).unwrap_or(serde_json::Value::Null)
         })
         .collect();
-    Ok(serde_json::to_string(
-        &serde_json::json!({"todo": todo, "recent_events": recent.into_iter().rev().collect::<Vec<_>>() }),
-    )?)
+    Ok(serde_json::to_string(&serde_json::json!({
+        "todo": todo,
+        "task_state": state,
+        "recent_events": recent.into_iter().rev().collect::<Vec<_>>()
+    }))?)
 }
 
 fn parse_action(text: &str) -> Result<Action> {
