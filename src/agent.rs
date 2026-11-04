@@ -41,9 +41,42 @@ pub struct AgentResult {
     pub steps: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskRoute {
+    SimpleCoding,
+    ResearchAssisted,
+    Debugging,
+    Planning,
+    General,
+}
+
+impl TaskRoute {
+    fn instruction(self) -> &'static str {
+        match self {
+            Self::SimpleCoding => {
+                "Implement the requested change directly, inspect existing files first, and verify the result locally."
+            }
+            Self::ResearchAssisted => {
+                "Gather reliable source evidence before acting, record relevant findings, then implement and verify."
+            }
+            Self::Debugging => {
+                "Reproduce the reported failure first, identify its root cause, apply the smallest safe fix, and rerun the failing check."
+            }
+            Self::Planning => {
+                "Decompose the objective into explicit dependent steps, complete them in order, and verify each acceptance criterion."
+            }
+            Self::General => {
+                "Clarify the objective from the available context, use safe tools, and finish only when evidence is sufficient."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskState {
     objective: String,
+    route: TaskRoute,
     phase: String,
     repair_cycles: usize,
     verification_failed: bool,
@@ -172,6 +205,7 @@ impl AutonomousAgent {
     pub async fn solve(&self, objective: &str) -> Result<AgentResult> {
         let tools = ToolRegistry::new();
         let sandbox = Sandbox::detect().await;
+        let route = classify_task(objective);
         let mut events = Vec::new();
         let mut todo = vec![objective.to_string()];
         let mut last_action = String::new();
@@ -180,6 +214,7 @@ impl AutonomousAgent {
         let mut verification_failed = false;
         let mut state = TaskState {
             objective: objective.to_string(),
+            route,
             phase: "implement".into(),
             repair_cycles: 0,
             verification_failed: false,
@@ -189,11 +224,20 @@ impl AutonomousAgent {
         };
         for step in 0..self.max_steps {
             let context = compact_context(&todo, &events, &state)?;
-            let action = match self.model.choose("Maintain the todo, act only with an available safe tool, and finish when evidence is sufficient.", &context).await {
+            let system = format!(
+                "Maintain the todo, act only with an available safe tool, and finish when evidence is sufficient. Route: {:?}. {}",
+                route,
+                route.instruction()
+            );
+            let action = match self.model.choose(&system, &context).await {
                 Ok(action) => action,
                 Err(error) => {
                     let message = error.to_string();
-                    events.push(Event { step, role: "protocol_error".into(), content: message.clone() });
+                    events.push(Event {
+                        step,
+                        role: "protocol_error".into(),
+                        content: message.clone(),
+                    });
                     if is_fatal_model_error(&message) {
                         return Ok(AgentResult {
                             answer: format!("Model endpoint rejected further requests: {message}"),
@@ -380,6 +424,54 @@ fn is_fatal_model_error(message: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
+fn classify_task(objective: &str) -> TaskRoute {
+    let lower = objective.to_ascii_lowercase();
+    let has = |terms: &[&str]| terms.iter().any(|term| lower.contains(term));
+    if has(&[
+        "research",
+        "look up",
+        "latest",
+        "current information",
+        "web search",
+        "cite sources",
+        "documentation",
+    ]) {
+        TaskRoute::ResearchAssisted
+    } else if has(&[
+        "debug",
+        "bug",
+        "traceback",
+        "error",
+        "failing test",
+        "regression",
+        "broken",
+    ]) {
+        TaskRoute::Debugging
+    } else if has(&[
+        "plan",
+        "design",
+        "architect",
+        "roadmap",
+        "workflow",
+        "multi-step",
+    ]) {
+        TaskRoute::Planning
+    } else if has(&[
+        "implement",
+        "create",
+        "write code",
+        "function",
+        "script",
+        "program",
+        "solve",
+        "build",
+    ]) {
+        TaskRoute::SimpleCoding
+    } else {
+        TaskRoute::General
+    }
+}
+
 fn normalize_written_content(path: &str, content: String) -> String {
     // Some providers double-escape bundled source, yielding a one-line file
     // containing literal "\\n" sequences. Repair only source-like files when
@@ -400,8 +492,8 @@ fn normalize_written_content(path: &str, content: String) -> String {
 #[cfg(test)]
 mod model_error_tests {
     use super::{
-        compact_context, is_fatal_model_error, normalize_written_content, parse_action, Action,
-        TaskState,
+        classify_task, compact_context, is_fatal_model_error, normalize_written_content,
+        parse_action, Action, TaskRoute, TaskState,
     };
 
     #[test]
@@ -439,6 +531,7 @@ mod model_error_tests {
     fn compact_context_preserves_typed_task_state() {
         let state = TaskState {
             objective: "build it".into(),
+            route: TaskRoute::SimpleCoding,
             phase: "repair".into(),
             repair_cycles: 1,
             verification_failed: true,
@@ -449,6 +542,26 @@ mod model_error_tests {
         let context = compact_context(&["repair".into()], &[], &state).unwrap();
         assert!(context.contains("solution.py"));
         assert!(context.contains("syntax error"));
+    }
+
+    #[test]
+    fn task_router_selects_specialized_routes() {
+        assert_eq!(
+            classify_task("Research the latest API documentation and cite sources"),
+            TaskRoute::ResearchAssisted
+        );
+        assert_eq!(
+            classify_task("Debug the traceback in the failing test"),
+            TaskRoute::Debugging
+        );
+        assert_eq!(
+            classify_task("Design a multi-step deployment workflow"),
+            TaskRoute::Planning
+        );
+        assert_eq!(
+            classify_task("Implement a Python function"),
+            TaskRoute::SimpleCoding
+        );
     }
 }
 
