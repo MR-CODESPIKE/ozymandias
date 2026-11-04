@@ -201,6 +201,76 @@ struct ResearchWorker {
 
 struct ParallelAdvisor;
 
+struct SelfConsistency;
+
+impl SelfConsistency {
+    fn eligible(route: TaskRoute, objective: &str) -> bool {
+        !ParallelAdvisor::roles(route, objective).is_empty()
+    }
+
+    fn vote_label(answer: &str) -> &'static str {
+        let lower = answer.to_ascii_lowercase();
+        if lower.contains("decompose") || lower.contains("plan first") {
+            "decompose"
+        } else if lower.contains("test_first") || lower.contains("test first") {
+            "test_first"
+        } else if lower.contains("research") {
+            "research_first"
+        } else {
+            "direct"
+        }
+    }
+
+    async fn run(model: &ModelClient, route: TaskRoute, objective: &str) -> (Vec<Event>, String) {
+        if !Self::eligible(route, objective) {
+            return (Vec::new(), "direct".into());
+        }
+        let mut voters = tokio::task::JoinSet::new();
+        for voter in 0..3 {
+            let voter_model = model.clone();
+            let voter_objective = objective.to_string();
+            voters.spawn(async move {
+                let context = format!(
+                    "Critical decision for objective: {voter_objective}\nVote independently for exactly one strategy: direct, decompose, test_first, or research_first. Return a finish answer beginning with VOTE: <strategy> and a one-sentence reason. This is voter {voter}."
+                );
+                (voter, voter_model.choose(
+                    "You are an independent self-consistency voter. Do not modify files or execute tools.",
+                    &context,
+                ).await)
+            });
+        }
+
+        let mut counts = std::collections::HashMap::<&'static str, usize>::new();
+        let mut events = Vec::new();
+        while let Some(result) = voters.join_next().await {
+            if let Ok((voter, Ok(Action::Finish { answer }))) = result {
+                let label = Self::vote_label(&answer);
+                *counts.entry(label).or_default() += 1;
+                events.push(Event {
+                    step: voter,
+                    role: "consistency_vote".into(),
+                    content: format!("{label}: {answer}"),
+                });
+            }
+        }
+        let selected = ["decompose", "test_first", "research_first", "direct"]
+            .into_iter()
+            .max_by_key(|label| {
+                (
+                    counts.get(label).copied().unwrap_or(0),
+                    usize::from(*label == "decompose"),
+                )
+            })
+            .unwrap_or("decompose");
+        events.push(Event {
+            step: 3,
+            role: "consistency_controller".into(),
+            content: format!("selected strategy: {selected}"),
+        });
+        (events, selected.into())
+    }
+}
+
 impl ParallelAdvisor {
     fn roles(route: TaskRoute, objective: &str) -> Vec<&'static str> {
         let lower = objective.to_ascii_lowercase();
@@ -416,6 +486,13 @@ impl AutonomousAgent {
                 MemoryKind::Evidence,
                 6,
             );
+        }
+        let (vote_events, strategy) = SelfConsistency::run(&self.model, route, objective).await;
+        events.extend(vote_events);
+        if SelfConsistency::eligible(route, objective) {
+            memory.remember("critical-strategy", &strategy, MemoryKind::Decision, 9);
+            todo[0] =
+                format!("Use the selected self-consistency strategy '{strategy}' for: {objective}");
         }
         if route == TaskRoute::ResearchAssisted {
             let worker = ResearchWorker::bounded(2);
@@ -726,7 +803,7 @@ fn normalize_written_content(path: &str, content: String) -> String {
 mod model_error_tests {
     use super::{
         classify_task, compact_context, is_fatal_model_error, normalize_written_content,
-        parse_action, Action, ParallelAdvisor, TaskRoute, TaskState,
+        parse_action, Action, ParallelAdvisor, SelfConsistency, TaskRoute, TaskState,
     };
     use crate::memory::LongContextMemory;
 
@@ -818,6 +895,26 @@ mod model_error_tests {
             2
         );
         assert!(ParallelAdvisor::roles(TaskRoute::General, "summarize this").is_empty());
+    }
+
+    #[test]
+    fn self_consistency_votes_are_selective_and_parseable() {
+        assert!(SelfConsistency::eligible(
+            TaskRoute::Planning,
+            "design a workflow"
+        ));
+        assert!(!SelfConsistency::eligible(
+            TaskRoute::General,
+            "summarize this"
+        ));
+        assert_eq!(
+            SelfConsistency::vote_label("VOTE: test_first because tests expose regressions"),
+            "test_first"
+        );
+        assert_eq!(
+            SelfConsistency::vote_label("VOTE: decompose before implementation"),
+            "decompose"
+        );
     }
 }
 
