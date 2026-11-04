@@ -1,4 +1,4 @@
-use crate::{sandbox::Sandbox, tools::ToolRegistry};
+use crate::{evaluate::verify_workspace, sandbox::Sandbox, tools::ToolRegistry};
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -438,14 +438,15 @@ impl AutonomousAgent {
                     // another model request; this prevents a valid artifact from
                     // timing out while waiting for a redundant final response.
                     if has_solution && has_tests {
-                        let verification = tools
-                            .shell(
-                                &sandbox,
-                                "python3 -m py_compile solution.py test_solution.py && python3 -m pytest -q test_solution.py",
-                            )
-                            .await;
-                        let passed = verification.is_ok();
-                        let verification_detail = format_result(verification);
+                        let verification = verify_workspace(&sandbox).await;
+                        let passed = verification
+                            .as_ref()
+                            .map(|result| result.passed)
+                            .unwrap_or(false);
+                        let verification_detail = match verification {
+                            Ok(result) => result.detail(),
+                            Err(error) => error.to_string(),
+                        };
                         events.push(Event {
                             step,
                             role: "tool".into(),
