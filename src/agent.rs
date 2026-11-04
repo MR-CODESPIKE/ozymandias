@@ -259,7 +259,10 @@ impl AutonomousAgent {
                     // timing out while waiting for a redundant final response.
                     if has_solution && has_tests {
                         let verification = tools
-                            .shell(&sandbox, "python3 -m pytest -q test_solution.py")
+                            .shell(
+                                &sandbox,
+                                "python3 -m py_compile solution.py test_solution.py && python3 -m pytest -q test_solution.py",
+                            )
                             .await;
                         let passed = verification.is_ok();
                         events.push(Event {
