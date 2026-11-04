@@ -1,4 +1,9 @@
-use crate::{evaluate::verify_workspace, sandbox::Sandbox, tools::ToolRegistry};
+use crate::{
+    evaluate::verify_workspace,
+    memory::{LongContextMemory, MemoryKind},
+    sandbox::Sandbox,
+    tools::ToolRegistry,
+};
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -292,6 +297,9 @@ impl AutonomousAgent {
         let sandbox = Sandbox::detect().await;
         let route = classify_task(objective);
         let mut events = Vec::new();
+        let mut memory = LongContextMemory::new(32);
+        memory.remember("objective", objective, MemoryKind::Fact, 10);
+        memory.remember("route", &format!("{route:?}"), MemoryKind::Decision, 8);
         let mut todo = vec![objective.to_string()];
         let mut last_action = String::new();
         let mut repeated_actions = 0usize;
@@ -312,6 +320,14 @@ impl AutonomousAgent {
             let worker = ResearchWorker::bounded(2);
             let (research_events, findings) = worker.run(&self.model, &tools, objective).await;
             events.extend(research_events);
+            for (index, finding) in findings.iter().enumerate() {
+                memory.remember(
+                    &format!("research-{index}"),
+                    finding,
+                    MemoryKind::Evidence,
+                    7,
+                );
+            }
             state.research_findings = findings;
             state.phase = "implement".into();
             todo[0] = format!(
@@ -319,7 +335,7 @@ impl AutonomousAgent {
             );
         }
         for step in 0..self.max_steps {
-            let context = compact_context(&todo, &events, &state)?;
+            let context = compact_context(&todo, &events, &state, &memory)?;
             let system = format!(
                 "Maintain the todo, act only with an available safe tool, and finish when evidence is sufficient. Route: {:?}. {}",
                 route,
@@ -401,6 +417,7 @@ impl AutonomousAgent {
                     });
                 }
                 Action::WriteFile { path, content } => {
+                    memory.remember(&format!("file-{path}"), "written", MemoryKind::Progress, 5);
                     if !state.changed_files.contains(&path) {
                         state.changed_files.push(path.clone());
                     }
@@ -419,6 +436,12 @@ impl AutonomousAgent {
                     let has_solution = files.contains_key("solution.py");
                     let has_tests = files.contains_key("test_solution.py");
                     for (path, content) in files {
+                        memory.remember(
+                            &format!("file-{path}"),
+                            "written",
+                            MemoryKind::Progress,
+                            5,
+                        );
                         if !state.changed_files.contains(&path) {
                             state.changed_files.push(path.clone());
                         }
@@ -453,6 +476,12 @@ impl AutonomousAgent {
                             content: verification_detail.clone(),
                         });
                         if passed {
+                            memory.remember(
+                                "verification",
+                                "deterministic checks passed",
+                                MemoryKind::Evidence,
+                                10,
+                            );
                             state.phase = "complete".into();
                             state.verified = true;
                             state.verification_failed = false;
@@ -468,6 +497,12 @@ impl AutonomousAgent {
                         state.repair_cycles = repair_cycles;
                         state.verification_failed = true;
                         state.verification_failures.push(verification_detail);
+                        memory.remember(
+                            &format!("verification-failure-{repair_cycles}"),
+                            state.verification_failures.last().unwrap(),
+                            MemoryKind::Failure,
+                            10,
+                        );
                         if repair_cycles >= 3 {
                             return Ok(AgentResult {
                                 answer: "Verification failed after three bounded repair cycles."
@@ -592,6 +627,7 @@ mod model_error_tests {
         classify_task, compact_context, is_fatal_model_error, normalize_written_content,
         parse_action, Action, TaskRoute, TaskState,
     };
+    use crate::memory::LongContextMemory;
 
     #[test]
     fn quota_429_is_fatal_and_does_not_consume_step_budget() {
@@ -637,9 +673,17 @@ mod model_error_tests {
             verification_failures: vec!["syntax error".into()],
             research_findings: vec!["Source: https://example.com".into()],
         };
-        let context = compact_context(&["repair".into()], &[], &state).unwrap();
+        let mut memory = LongContextMemory::new(4);
+        memory.remember(
+            "important-evidence",
+            "tests passed previously",
+            crate::memory::MemoryKind::Evidence,
+            10,
+        );
+        let context = compact_context(&["repair".into()], &[], &state, &memory).unwrap();
         assert!(context.contains("solution.py"));
         assert!(context.contains("syntax error"));
+        assert!(context.contains("important-evidence"));
     }
 
     #[test]
@@ -663,7 +707,12 @@ mod model_error_tests {
     }
 }
 
-fn compact_context(todo: &[String], events: &[Event], state: &TaskState) -> Result<String> {
+fn compact_context(
+    todo: &[String],
+    events: &[Event],
+    state: &TaskState,
+    memory: &LongContextMemory,
+) -> Result<String> {
     let recent: Vec<serde_json::Value> = events
         .iter()
         .rev()
@@ -680,6 +729,7 @@ fn compact_context(todo: &[String], events: &[Event], state: &TaskState) -> Resu
     Ok(serde_json::to_string(&serde_json::json!({
         "todo": todo,
         "task_state": state,
+        "long_context_summary": memory.summarize(6000),
         "recent_events": recent.into_iter().rev().collect::<Vec<_>>()
     }))?)
 }
