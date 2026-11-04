@@ -195,6 +195,98 @@ impl ModelClient {
     }
 }
 
+struct ToolRecovery;
+
+impl ToolRecovery {
+    async fn shell(tools: &ToolRegistry, sandbox: &Sandbox, command: &str) -> Result<String> {
+        match tools.shell(sandbox, command).await {
+            Ok(output) => Ok(output),
+            Err(error) if Self::pytest_unavailable(&error.to_string(), command) => {
+                let fallback = "python3 -m unittest discover -s . -p 'test_*.py'";
+                tools.shell(sandbox, fallback).await.map(|output| {
+                    format!("RECOVERY: pytest unavailable; used unittest fallback.\n{output}")
+                })
+            }
+            Err(error)
+                if Self::retryable(&error.to_string()) && Self::retryable_command(command) =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tools
+                    .shell(sandbox, command)
+                    .await
+                    .map(|output| format!("RECOVERY: retried transient shell failure.\n{output}"))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn read_file(tools: &ToolRegistry, path: &str) -> Result<String> {
+        match tools.read_file(path).await {
+            Ok(output) => Ok(output),
+            Err(error) if Self::retryable(&error.to_string()) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tools
+                    .read_file(path)
+                    .await
+                    .map(|output| format!("RECOVERY: retried transient read failure.\n{output}"))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn web_get(tools: &ToolRegistry, url: &str) -> Result<String> {
+        match tools.web_get(url).await {
+            Ok(output) => Ok(output),
+            Err(error) if Self::retryable(&error.to_string()) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tools
+                    .web_get(url)
+                    .await
+                    .map(|output| format!("RECOVERY: retried transient web failure.\n{output}"))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn retryable(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        [
+            "timed out",
+            "timeout",
+            "connection reset",
+            "temporarily unavailable",
+            "resource temporarily unavailable",
+            "broken pipe",
+            "failed to execute",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    }
+
+    fn retryable_command(command: &str) -> bool {
+        let lower = command.to_ascii_lowercase();
+        [
+            "pytest",
+            "unittest",
+            "cargo test",
+            "node --check",
+            "npm test",
+            "git diff",
+            "git status",
+            "ls",
+            "pwd",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    }
+
+    fn pytest_unavailable(message: &str, command: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        command.to_ascii_lowercase().contains("pytest")
+            && (lower.contains("pytest: not found") || lower.contains("no module named pytest"))
+    }
+}
+
 struct ResearchWorker {
     max_calls: usize,
 }
@@ -398,7 +490,7 @@ impl ResearchWorker {
             };
             match action {
                 Action::WebGet { url } => {
-                    let result = tools.web_get(&url).await;
+                    let result = ToolRecovery::web_get(tools, &url).await;
                     let detail = format_result(result);
                     let excerpt = detail.chars().take(4000).collect::<String>();
                     findings.push(format!("Source: {url}\n{excerpt}"));
@@ -579,7 +671,7 @@ impl AutonomousAgent {
                     });
                 }
                 Action::Shell { command } => {
-                    let r = tools.shell(&sandbox, &command).await;
+                    let r = ToolRecovery::shell(&tools, &sandbox, &command).await;
                     events.push(Event {
                         step,
                         role: "tool".into(),
@@ -587,7 +679,7 @@ impl AutonomousAgent {
                     });
                 }
                 Action::ReadFile { path } => {
-                    let r = tools.read_file(&path).await;
+                    let r = ToolRecovery::read_file(&tools, &path).await;
                     events.push(Event {
                         step,
                         role: "tool".into(),
@@ -692,7 +784,7 @@ impl AutonomousAgent {
                     }
                 }
                 Action::WebGet { url } => {
-                    let r = tools.web_get(&url).await;
+                    let r = ToolRecovery::web_get(&tools, &url).await;
                     events.push(Event {
                         step,
                         role: "tool".into(),
@@ -803,7 +895,7 @@ fn normalize_written_content(path: &str, content: String) -> String {
 mod model_error_tests {
     use super::{
         classify_task, compact_context, is_fatal_model_error, normalize_written_content,
-        parse_action, Action, ParallelAdvisor, SelfConsistency, TaskRoute, TaskState,
+        parse_action, Action, ParallelAdvisor, SelfConsistency, TaskRoute, TaskState, ToolRecovery,
     };
     use crate::memory::LongContextMemory;
 
@@ -915,6 +1007,23 @@ mod model_error_tests {
             SelfConsistency::vote_label("VOTE: decompose before implementation"),
             "decompose"
         );
+    }
+
+    #[test]
+    fn tool_recovery_only_retries_safe_transient_operations() {
+        assert!(ToolRecovery::retryable("connection reset by peer"));
+        assert!(ToolRecovery::retryable_command("python3 -m unittest -q"));
+        assert!(!ToolRecovery::retryable_command(
+            "python3 mutate_database.py"
+        ));
+        assert!(ToolRecovery::pytest_unavailable(
+            "command failed: pytest: not found",
+            "pytest -q"
+        ));
+        assert!(!ToolRecovery::pytest_unavailable(
+            "test assertion failed",
+            "pytest -q"
+        ));
     }
 }
 
