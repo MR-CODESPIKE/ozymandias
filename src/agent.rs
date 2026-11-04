@@ -165,6 +165,8 @@ impl AutonomousAgent {
         let mut todo = vec![objective.to_string()];
         let mut last_action = String::new();
         let mut repeated_actions = 0usize;
+        let mut repair_cycles = 0usize;
+        let mut verification_failed = false;
         for step in 0..self.max_steps {
             let context = compact_context(&todo, &events)?;
             let action = match self.model.choose("Maintain the todo, act only with an available safe tool, and finish when evidence is sufficient.", &context).await {
@@ -204,11 +206,22 @@ impl AutonomousAgent {
             });
             match action {
                 Action::Finish { answer } => {
+                    if verification_failed {
+                        events.push(Event {
+                            step,
+                            role: "controller".into(),
+                            content: "Rejected premature finish after failed verification; repair the reported failure first.".into(),
+                        });
+                        todo[0] = format!(
+                            "Verification is still failing. Diagnose the latest failure and repair the artifact for: {objective}"
+                        );
+                        continue;
+                    }
                     return Ok(AgentResult {
                         answer,
                         events,
                         steps: step + 1,
-                    })
+                    });
                 }
                 Action::Shell { command } => {
                     let r = tools.shell(&sandbox, &command).await;
@@ -277,6 +290,16 @@ impl AutonomousAgent {
                                 steps: step + 1,
                             });
                         }
+                        verification_failed = true;
+                        repair_cycles += 1;
+                        if repair_cycles >= 3 {
+                            return Ok(AgentResult {
+                                answer: "Verification failed after three bounded repair cycles."
+                                    .into(),
+                                events,
+                                steps: step + 1,
+                            });
+                        }
                     }
                 }
                 Action::WebGet { url } => {
@@ -288,9 +311,15 @@ impl AutonomousAgent {
                     });
                 }
             }
-            todo[0] = format!(
-                "Complete objective: {objective}; verify the latest observation before finishing"
-            );
+            todo[0] = if verification_failed {
+                format!(
+                    "Repair cycle {repair_cycles}/3: diagnose the latest verification failure, modify the artifact, rerun the tests, and do not finish until they pass: {objective}"
+                )
+            } else {
+                format!(
+                    "Complete objective: {objective}; verify the latest observation before finishing"
+                )
+            };
         }
         Ok(AgentResult {
             answer: "Step budget exhausted before verified completion.".into(),
