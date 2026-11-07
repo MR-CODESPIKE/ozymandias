@@ -14,6 +14,7 @@ humaneval_batches/
 mbpp_benchmark/data/
 mbpp_benchmark/runs/
 benchmarks/browsecomp/data/
+benchmarks/vendor/
 benchmarks/results/browsecomp_subset_*.json
 *.log
 
